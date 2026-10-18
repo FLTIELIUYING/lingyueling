@@ -198,11 +198,11 @@ async function runLingYueLing(CSS,PORTRAIT) {
   const KEY='__lingyueling_dispose',SETTINGS='lingyueling_settings';
   if(typeof host[KEY]==='function')host[KEY]();
   const api=name=>{
-    for(const owner of [window,window.TavernHelper,host.TavernHelper]) {
+    const bound=host.TavernHelper?._bind?.['_'+name];
+    if(typeof bound==='function')return bound.bind(window);
+    for(const owner of [host.TavernHelper,window,window.TavernHelper]) {
       if(typeof owner?.[name]==='function')return owner[name].bind(owner===window?window:owner);
     }
-    const bound=host.TavernHelper?._bind?.['_'+name];
-    return typeof bound==='function'?bound.bind(window):undefined;
   };
   const health={phase:'starting',detail:'正在连接酒馆助手',missing:[],cards:0};
   host.__lingyueling_health=health;
@@ -215,19 +215,21 @@ async function runLingYueLing(CSS,PORTRAIT) {
   }
   const required=['getChatMessages','setChatMessages','getVariables','updateVariablesWith','injectPrompts','eventOn'];
   // 助手的预定义接口与聊天 DOM 都可能晚于脚本挂载。
-  for(let attempt=0;attempt<80;attempt++) {
+  for(let attempt=0;;attempt++) {
+    if(host.__lingyueling_health!==health)return;
     health.missing=required.filter(name=>!api(name));
     if(!health.missing.length)break;
+    health.phase='waiting';
     connection('正在等待酒馆助手接口：'+health.missing.join('、'));
-    await new Promise(resolve=>setTimeout(resolve,250));
+    await new Promise(resolve=>setTimeout(resolve,attempt<80?250:1500));
   }
-  const getMessages=api('getChatMessages'),setMessages=api('setChatMessages'),getVars=api('getVariables'),updateVars=api('updateVariablesWith'),inject=api('injectPrompts'),uninject=api('uninjectPrompts'),on=api('eventOn');
-  if(!getMessages||!setMessages||!getVars||!updateVars||!inject||!on){
-    throw new Error('助手接口未就绪：'+health.missing.join('、'));
-  }
+  const call=(name,...args)=>{const fn=api(name);if(!fn)throw new Error('正在等待酒馆助手接口：'+name);return fn(...args);};
+  const getMessages=(...args)=>call('getChatMessages',...args),setMessages=(...args)=>call('setChatMessages',...args),getVars=(...args)=>call('getVariables',...args),updateVars=(...args)=>call('updateVariablesWith',...args),inject=(...args)=>call('injectPrompts',...args),uninject=(...args)=>api('uninjectPrompts')?.(...args),on=(...args)=>call('eventOn',...args);
   let disposed=false,generating=false,settings={},messages=[],state=C.replay([]),contextKey='',queue=Promise.resolve(),refreshTimer;
   let panelOpen=false,panelAnchor=null,tab='quests',taskTab='active',serviceTab='draw',drawType='technique',rank='黄阶',selected=[],notice='',noticeError=false;
-  let mvuReady=false,mvuUpdating=false,injectHandle,lastSignature='',syncTimer,globalReady=false,observer;
+  let mvuReady=false,mvuUpdating=false,injectHandle,lastSignature='',syncTimer,observer;
+  let generationAt=0,sawHostBusy=false,mvuRef=null,eventBus=null,helperRef=null,eventNames='',bound=false,lastError='',lastErrorAt=0;
+  const hostStops=[],mvuStops=[];
   const stops=[],cardRoots=new Map(),receiptRoots=new Map(),boundRoots=new WeakSet();
   const panelHost=doc.createElement('div');panelHost.className='lingyueling-shared-sea';
   const panel=panelHost.attachShadow({mode:'open'});
@@ -237,16 +239,34 @@ async function runLingYueLing(CSS,PORTRAIT) {
   const b=(label,action,data={},secondary=false,disabled=false)=>`<button type="button" class="button${secondary?' secondary':''}" data-action="${action}" ${Object.entries(data).map(([k,v])=>`data-${k}="${e(v)}"`).join(' ')} ${disabled?'disabled':''}>${e(label)}</button>`;
   const statusLabel={offered:'待接取',active:'进行中',completed:'已结算',failed:'已失效',abandoned:'已放弃'};
   function context() {
-    const st=window.SillyTavern||host.SillyTavern;
+    const st=host.SillyTavern||window.SillyTavern;
     const ctx=st?.getContext?.()||(st?.chat?st:null);
     return {ctx,key:String(ctx?.getCurrentChatId?.()??ctx?.chatId??ctx?.characters?.[ctx?.characterId]?.chat??''),name:ctx?.name2||ctx?.characters?.[ctx?.characterId]?.name||''};
   }
   function active(ctx,list) {return /道渊/.test(ctx.name)||list.some(m=>/\[Ling(?:Dialog|Task|TaskBoard|Item|Place)\]/.test(m.message));}
   function readMessages(){return getMessages('0-{{lastMessageId}}',{hide_state:'all'}).map(m=>({message_id:m.message_id,role:m.role,message:m.message,extra:m.extra,is_hidden:m.is_hidden}));}
-  function announce(message,error=false) {notice=message;noticeError=error;renderPanel();if(error&&!panelOpen)(host.toastr||window.toastr)?.error(message);}
-  function stopHandle(handle){if(handle?.stop)stops.push(()=>handle.stop());else if(typeof handle==='function')stops.push(handle);}
+  function announce(message,error=false) {notice=message;noticeError=error;renderPanel();if(error&&!panelOpen&&(message!==lastError||Date.now()-lastErrorAt>2500)){lastError=message;lastErrorAt=Date.now();(host.toastr||window.toastr)?.error(message);}}
+  function stopHandle(handle,list=stops){if(handle?.stop)list.push(()=>handle.stop());else if(typeof handle==='function')list.push(handle);}
+  function clearHandles(list){list.splice(0).reverse().forEach(stop=>{try{stop();}catch{}});}
+  function M(){return host.Mvu||window.Mvu;}
+  function activity() {
+    let live=null;
+    if(doc.body?.dataset.generating==='true')live=true;
+    else {
+      const stop=doc.getElementById('mes_stop');
+      if(stop){const style=host.getComputedStyle(stop);live=!stop.hidden&&style.display!=='none'&&style.visibility!=='hidden'&&stop.getClientRects().length>0;}
+    }
+    const was=generating;
+    if(live===true){generating=true;sawHostBusy=true;}
+    else if(live===false&&(!generating||sawHostBusy||Date.now()-generationAt>=500)){generating=false;sawHostBusy=false;}
+    let extra=false;try{extra=!!M()?.isDuringExtraAnalysis?.();}catch{}
+    health.activity={reply:generating,variables:mvuUpdating,extraAnalysis:extra,source:live===null?'生成事件':'酒馆界面与生成事件'};
+    if(was&&!generating){schedule(0);scheduleSync();}
+    return health.activity;
+  }
+  function busyError(){const error=new Error('请等当前回复生成结束后再操作。');error.code='LYL_BUSY';return error;}
   function currentMvu(messageId) {
-    try{return mvuReady?window.Mvu.getMvuData({type:'message',message_id:messageId}):null;}catch{return null;}
+    try{return mvuReady?M().getMvuData({type:'message',message_id:messageId}):null;}catch{return null;}
   }
   function world() {
     for(let i=messages.length-1;i>=0;i--){const m=currentMvu(messages[i].message_id);if(m?.stat_data?.世界)return m.stat_data.世界;}
@@ -279,7 +299,7 @@ async function runLingYueLing(CSS,PORTRAIT) {
   }
   function useQueue(fn) {
     const result=queue.then(()=>{if(!disposed)return fn();});
-    queue=result.catch(error=>{console.error('[玲月灵]',error);health.phase='error';connection('玲月灵连接异常：'+(error.message||String(error)),true);announce(error.message||'操作未完成，请重试。',true);});
+    queue=result.catch(error=>{if(error.code!=='LYL_BUSY'){console.error('[玲月灵]',error);health.phase='error';connection('玲月灵连接异常：'+(error.message||String(error)),true);}announce(error.message||'操作未完成，请重试。',true);});
     return result;
   }
   function schedule(delay=100) {
@@ -289,7 +309,7 @@ async function runLingYueLing(CSS,PORTRAIT) {
     clearTimeout(syncTimer);syncTimer=setTimeout(()=>useQueue(syncItems).catch(()=>{}),delay);
   }
   async function refresh(force=false) {
-    if(disposed||generating&&!force)return;
+    if(disposed||activity().reply&&!force)return;
     const ctx=context(),list=readMessages();
     if(!ctx.key||!active(ctx,list)){
       contextKey='';state=C.replay([]);messages=[];panelOpen=false;panelHost.remove();injectHandle?.uninject?.();return;
@@ -303,7 +323,8 @@ async function runLingYueLing(CSS,PORTRAIT) {
   }
   async function saveAction(action) {
     const key=context().key;
-    if(!key||key!==contextKey||generating)throw new Error('请等当前回复生成结束后再操作。');
+    if(!key||key!==contextKey)throw new Error('当前聊天已切换，请重新打开识海后操作。');
+    if(activity().reply)throw busyError();
     const fresh=readMessages(),before=C.replay(fresh,settings),last=[...fresh].reverse().find(m=>!m.is_hidden);
     if(!last)throw new Error('请先创建一段聊天。');
     const chain=before.messageChains[last.message_id];
@@ -443,7 +464,8 @@ async function runLingYueLing(CSS,PORTRAIT) {
     return '玲月灵，请为我进行一次'+r.rank+(r.kind==='technique'?'功法':'装备')+'祈愿，成功后消耗'+r.cost+'修命点。';
   }
   async function syncItems(selectedUid) {
-    if(!mvuReady||mvuUpdating||generating||!contextKey||window.Mvu.isDuringExtraAnalysis?.())return;
+    const busy=activity();
+    if(!mvuReady||busy.variables||busy.reply||!contextKey||busy.extraAnalysis)return;
     await refresh(true);
     const key=contextKey,chain=state.chain,last=messages.at(-1);
     if(!last||!selectedUid&&last.role!=='assistant')return;
@@ -461,7 +483,7 @@ async function runLingYueLing(CSS,PORTRAIT) {
       if(!plan.existing){
         const next=C.clone(data);
         Object.defineProperty(next.stat_data.主角[plan.field],item.name,{value:C.clone(item.value),enumerable:true,writable:true,configurable:true});
-        await window.Mvu.replaceMvuData(next,{type:'message',message_id:last.message_id});
+        await M().replaceMvuData(next,{type:'message',message_id:last.message_id});
         if(context().key!==key)return;
         const saved=currentMvu(last.message_id)?.stat_data?.主角?.[plan.field]?.[item.name];
         if(!saved||saved.描述!==item.value.描述){announce('主卡尚未确认录入，暂不扣点；可稍后补录。',true);continue;}
@@ -485,7 +507,8 @@ async function runLingYueLing(CSS,PORTRAIT) {
     if(action==='source'){const target=doc.querySelector(`.mes[mesid="${Number(el.dataset.message)}"]`);if(target)target.scrollIntoView({behavior:host.matchMedia('(prefers-reduced-motion:reduce)').matches?'instant':'smooth',block:'center'});else announce('来源位于第 '+(Number(el.dataset.message)+1)+' 楼，请先加载更早的聊天消息。');return;}
     useQueue(async()=>{
       await refresh(true);
-      if(generating)throw new Error('请等当前回复生成结束后再操作。');
+      const writeAction=['accept','track','untrack','abandon','cancel-request','request-service','retry-item','save-settings'].includes(action);
+      if(writeAction&&activity().reply)throw busyError();
       if(action==='accept'){
         if(state.tasks[id]?.status!=='offered')return;
         await saveAction({type:'accept',id});announce('已接取「'+state.tasks[id].title+'」，未提前发放奖励。');
@@ -533,53 +556,88 @@ async function runLingYueLing(CSS,PORTRAIT) {
     if(host[KEY]===cleanup)delete host[KEY];
   }
   host[KEY]=cleanup;
-  window.addEventListener('pagehide',cleanup,{once:true});
+  const onPageHide=event=>{if(!event.persisted)cleanup();};
+  window.addEventListener('pagehide',onPageHide);
+  stops.push(()=>window.removeEventListener('pagehide',onPageHide));
   observer=new host.MutationObserver(mutations=>{
     if(mutations.some(m=>[...m.addedNodes].some(n=>n.nodeType===1&&(n.matches?.('[data-lyl-kind],.mes,.mes_text')||n.querySelector?.('[data-lyl-kind]')))))schedule();
   });
   // 观察稳定的根节点，兼容脚本先启动、聊天稍后出现和聊天容器重建。
-  observer.observe(doc.body||doc.documentElement,{childList:true,subtree:true});
-  const events=window.tavern_events||host.TavernHelper?.tavern_events||context().ctx?.eventTypes||{};
-  for(const name of ['MESSAGE_SWIPED','MESSAGE_SENT','MESSAGE_RECEIVED','MESSAGE_EDITED','MESSAGE_DELETED','MESSAGE_UPDATED','MESSAGE_SWIPE_DELETED','MORE_MESSAGES_LOADED','CHARACTER_MESSAGE_RENDERED','USER_MESSAGE_RENDERED'])if(events[name])stopHandle(on(events[name],()=>schedule()));
-  if(events.CHAT_CHANGED)stopHandle(on(events.CHAT_CHANGED,()=>{panelOpen=false;panelHost.remove();injectHandle?.uninject?.();contextKey='';schedule(20);}));
-  if(events.GENERATION_STARTED)stopHandle(on(events.GENERATION_STARTED,()=>{generating=true;}));
-  if(events.GENERATION_AFTER_COMMANDS)stopHandle(on(events.GENERATION_AFTER_COMMANDS,async()=>{await queue;await refresh(true);injectSummary();}));
-  for(const name of ['GENERATION_ENDED','GENERATION_STOPPED'])if(events[name])stopHandle(on(events[name],()=>{generating=false;schedule(100);scheduleSync();}));
-  if(api('getButtonEvent'))stopHandle(on(api('getButtonEvent')('打开识海'),()=>{useQueue(async()=>{await refresh(true);if(contextKey)openPanel();else announce('当前聊天未启用玲月灵扩展。',true);}).catch(()=>{});}));
-  if(api('getButtonEvent'))stopHandle(on(api('getButtonEvent')('检查连接'),()=>{
+  observer.observe(doc.documentElement,{childList:true,subtree:true});
+  function showDiagnostics() {
     const ctx=context();
-    const lines=['玲月灵 · 连接检查',health.detail,'当前聊天标识：'+(ctx.key?'可用':'未取得'),'聊天容器：'+(doc.querySelector('#chat')?'可用':'未出现'),'已读消息：'+messages.length,'正则卡片：'+doc.querySelectorAll('[data-lyl-kind]').length,'已挂载卡片：'+cardRoots.size,'MVU：'+(mvuReady?'已连接':'等待初始化')];
+    const busy=activity();
+    const lines=['玲月灵 · 连接检查',health.detail,'当前聊天标识：'+(ctx.key?'可用':'未取得'),'聊天容器：'+(doc.querySelector('#chat')?'可用':'未出现'),'已读消息：'+messages.length,'正则卡片：'+doc.querySelectorAll('[data-lyl-kind]').length,'已挂载卡片：'+cardRoots.size,'MVU：'+(mvuReady?'已连接':'等待初始化'),'回复状态：'+(busy.reply?'生成中':'空闲'),'变量解析：'+(busy.extraAnalysis?'额外解析中':busy.variables?'更新中':'空闲'),'状态依据：'+busy.source,'监听恢复次数：'+(health.rebindings||0)];
     let output=doc.getElementById('lingyueling-connection-check');
     if(!output){output=doc.createElement('dialog');output.id='lingyueling-connection-check';output.style.cssText='background:#251e2b;color:#eee3e1;border:1px solid #a36e82;border-radius:12px;padding:24px;font:14px/2 sans-serif;max-width:90vw';doc.body.appendChild(output);stops.push(()=>output.remove());}
     output.replaceChildren();const text=doc.createElement('div');text.style.whiteSpace='pre-wrap';text.textContent=lines.join('\n');output.appendChild(text);
     const close=doc.createElement('button');close.textContent='关闭';close.style.cssText='margin-top:14px;padding:5px 18px;cursor:pointer';close.onclick=()=>output.close();output.appendChild(close);if(!output.open)output.showModal();
-  }));
-  stopHandle(on('daoyuan_mvu_manual_updated',()=>schedule(80)));
+  }
+  function bindMvu(force=false) {
+    const candidate=M();
+    const ready=typeof candidate?.getMvuData==='function'&&typeof candidate?.replaceMvuData==='function';
+    if(!force&&candidate===mvuRef&&ready===mvuReady)return false;
+    const sameMvu=candidate===mvuRef;
+    clearHandles(mvuStops);mvuRef=candidate;
+    mvuReady=ready;if(!sameMvu||!ready)mvuUpdating=false;
+    health.mvuReady=mvuReady;
+    if(mvuReady)health.mvuConnections=(health.mvuConnections||0)+1;
+    if(!mvuReady)return true;
+    const listen=(name,handler)=>{if(candidate.events?.[name])stopHandle(on(candidate.events[name],()=>{if(M()===candidate)handler();}),mvuStops);};
+    listen('VARIABLE_UPDATE_STARTED',()=>{mvuUpdating=true;});
+    for(const name of ['BEFORE_MESSAGE_UPDATE','VARIABLE_UPDATE_ENDED'])listen(name,()=>{mvuUpdating=false;schedule(100);scheduleSync();});
+    schedule(20);return true;
+  }
+  function bindEvents(force=false) {
+    const ctx=context().ctx,events=ctx?.eventTypes||host.TavernHelper?.tavern_events||window.tavern_events||{};
+    const bus=ctx?.eventSource||null,helper=host.TavernHelper||window.TavernHelper||window;
+    const names=JSON.stringify(events)+'|buttons:'+!!api('getButtonEvent');
+    if(!force&&bound&&bus===eventBus&&helper===helperRef&&names===eventNames)return false;
+    clearHandles(hostStops);eventBus=bus;helperRef=helper;eventNames=names;bound=false;
+    const listen=(name,handler)=>{if(events[name])stopHandle(on(events[name],handler),hostStops);};
+    try {
+      for(const name of ['MESSAGE_SWIPED','MESSAGE_SENT','MESSAGE_RECEIVED','MESSAGE_EDITED','MESSAGE_DELETED','MESSAGE_UPDATED','MESSAGE_SWIPE_DELETED','MORE_MESSAGES_LOADED','CHARACTER_MESSAGE_RENDERED','USER_MESSAGE_RENDERED'])listen(name,()=>schedule());
+      listen('CHAT_CHANGED',()=>{panelOpen=false;panelHost.remove();injectHandle?.uninject?.();contextKey='';generating=false;generationAt=0;sawHostBusy=false;mvuUpdating=false;activity();schedule(20);});
+      listen('GENERATION_STARTED',(_type,options,dryRun)=>{
+        if(dryRun||options?.dryRun)return;
+        generating=true;generationAt=Date.now();sawHostBusy=false;activity();renderPanel();
+      });
+      listen('GENERATION_AFTER_COMMANDS',async()=>{await queue;if(disposed)return;await refresh(true);injectSummary();});
+      for(const name of ['GENERATION_ENDED','GENERATION_STOPPED'])listen(name,()=>{generating=false;sawHostBusy=false;schedule(100);scheduleSync();});
+      const button=api('getButtonEvent');
+      if(button){
+        stopHandle(on(button('打开识海'),()=>useQueue(async()=>{await refresh(true);if(contextKey)openPanel();else announce('当前聊天未启用玲月灵扩展。',true);}).catch(()=>{})),hostStops);
+        stopHandle(on(button('检查连接'),()=>useQueue(async()=>{activity();bindMvu();await refresh(true);showDiagnostics();}).catch(()=>{})),hostStops);
+      }
+      stopHandle(on('daoyuan_mvu_manual_updated',()=>schedule(80)),hostStops);
+      bound=true;health.rebindings=(health.rebindings||0)+1;bindMvu(true);return true;
+    }catch(error){clearHandles(hostStops);throw error;}
+  }
+  stops.push(()=>clearHandles(hostStops),()=>clearHandles(mvuStops));
   const waitGlobal=api('waitGlobalInitialized');
-  if(waitGlobal)waitGlobal('Mvu').then(()=>{globalReady=true;}).catch(error=>announce('等待 MVU 初始化失败：'+error.message,true));
-  else globalReady=true;
-  const mvuTimer=setInterval(()=>{
-    if(disposed){clearInterval(mvuTimer);return;}
-    if(!globalReady||!window.Mvu?.getMvuData||!window.Mvu?.replaceMvuData)return;
-    mvuReady=true;clearInterval(mvuTimer);
-    if(window.Mvu.events?.VARIABLE_UPDATE_STARTED)stopHandle(on(window.Mvu.events.VARIABLE_UPDATE_STARTED,()=>{mvuUpdating=true;}));
-    if(window.Mvu.events?.BEFORE_MESSAGE_UPDATE)stopHandle(on(window.Mvu.events.BEFORE_MESSAGE_UPDATE,()=>{mvuUpdating=false;schedule(120);scheduleSync();}));
-    if(window.Mvu.events?.VARIABLE_UPDATE_ENDED)stopHandle(on(window.Mvu.events.VARIABLE_UPDATE_ENDED,()=>{mvuUpdating=false;schedule(100);scheduleSync();}));
-    schedule(20);
-  },250);
-  stops.push(()=>clearInterval(mvuTimer));
+  if(waitGlobal)Promise.resolve().then(()=>waitGlobal('Mvu')).catch(error=>{if(!disposed)console.warn('[玲月灵] 等待 MVU 接口',error);});
   let fingerprint='';
-  const reconnectTimer=setInterval(()=>{
-    if(disposed||generating)return;
-    const ctx=context(),chat=ctx.ctx?.chat;
-    const signature=ctx.key+'|'+(chat?.length??messages.length)+'|'+doc.querySelectorAll('[data-lyl-kind]').length+'|'+[...cardRoots.keys()].filter(el=>el.isConnected).length;
-    if(signature!==fingerprint||health.phase!=='ready'){fingerprint=signature;schedule(0);}
-    if(!ctx.key&&doc.querySelector('[data-lyl-kind]'))connection('脚本已启动，等待当前聊天标识；可切换一次聊天后重试。',true);
-  },1500);
+  function recover() {
+    if(disposed)return;
+    const busy=activity(); // 恢复检查本身不受残留生成锁阻挡。
+    health.missing=required.filter(name=>!api(name));
+    if(health.missing.length){health.phase='waiting';connection('正在等待酒馆助手重新就绪：'+health.missing.join('、'));return;}
+    try {
+      const rebound=bindEvents(),mvuChanged=bindMvu(),ctx=context(),chat=ctx.ctx?.chat,last=chat?.at?.(-1);
+      const signature=ctx.key+'|'+(chat?.length??messages.length)+'|'+doc.querySelectorAll('[data-lyl-kind]').length+'|'+[...cardRoots.keys()].filter(el=>el.isConnected).length+'|'+busy.reply+'|'+mvuReady+'|'+(last?C.hash(last.mes??last.message??''):'');
+      if(rebound||mvuChanged||signature!==fingerprint||health.phase!=='ready'){fingerprint=signature;schedule(0);}
+      if(!ctx.key&&doc.querySelector('[data-lyl-kind]'))connection('脚本已启动，等待当前聊天标识；可切换一次聊天后重试。',true);
+    }catch(error){health.phase='waiting';connection('正在恢复玲月灵连接：'+error.message);}
+  }
+  const reconnectTimer=setInterval(recover,1000);
   stops.push(()=>clearInterval(reconnectTimer));
+  const resume=()=>{if(!disposed){recover();schedule(0);scheduleSync();}};
+  window.addEventListener('pageshow',resume);doc.addEventListener('visibilitychange',resume);window.addEventListener('focus',resume);
+  stops.push(()=>window.removeEventListener('pageshow',resume),()=>doc.removeEventListener('visibilitychange',resume),()=>window.removeEventListener('focus',resume));
+  recover();
   await refresh(true);
   // 调试入口只读，不替换原卡函数或注册其 schema。
-  const debug={snapshot:()=>C.clone(state),health:()=>({...health}),refresh:()=>useQueue(()=>refresh(true)),dispose:cleanup};
+  const debug={snapshot:()=>C.clone(state),health:()=>C.clone(health),refresh:()=>useQueue(()=>refresh(true)),dispose:cleanup};
   host.__lingyueling=debug;
   stops.push(()=>{if(host.__lingyueling===debug)delete host.__lingyueling;});
 }
