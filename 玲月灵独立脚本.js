@@ -86,7 +86,7 @@ function createLingCore() {
       state.ledger.push({id:'task:'+id,reason:task.title,amount:task.reward,message:source.message_id});
       task.progress='已完成';
     }
-    if(state.tracked===id)state.tracked=Object.values(state.tasks).find(t=>t.status==='active')?.id||'';
+    if(state.tracked===id)state.tracked='';
   }
   function eligibleItem(state,item) {
     if(item.source==='story')return item.requestId?{ok:false,reason:'剧情所得不能附带付费请求编号，请核对来源。'}:{ok:true,cost:0};
@@ -112,6 +112,7 @@ function createLingCore() {
     const id=safeId(event.id);
     if(event.type==='accept')accept(state,id,{...source,ui:true});
     if(event.type==='track'&&state.tasks[id]?.status==='active')state.tracked=id;
+    if(event.type==='untrack'&&state.tracked===id)state.tracked='';
     if(event.type==='abandon')settle(state,id,'abandoned','主动放弃',source);
     if(event.type==='request')request(state,event,source);
     if(event.type==='cancel'&&state.requests[id]?.status==='pending')state.requests[id].status='cancelled';
@@ -161,10 +162,18 @@ function createLingCore() {
     state.available=available(state);state.chain=chain;
     return state;
   }
-  function summary(state,world={}) {
-    const tasks=Object.values(state.tasks).filter(t=>t.status==='active').map(t=>({编号:t.id,任务:t.title,目标:t.target,进度:t.progress,时限:t.deadline,位阶:t.rank,完成奖励:t.reward}));
+  function summary(state,world={},userText='') {
+    const all=Object.values(state.tasks),tracked=all.find(t=>t.status==='active'&&t.id===state.tracked);
+    const pack=t=>({编号:t.id,任务:t.title,状态:{offered:'待接取',active:'已接取',completed:'已结算',failed:'已失效',abandoned:'已放弃'}[t.status],是否追踪:t.id===tracked?.id,目标:t.target,进度:t.progress,时限:t.deadline,位阶:t.rank,完成奖励:t.reward});
+    // 默认只提供追踪项。玩家点名或查询时才取出其他卷宗，避免详情诱导支线。
+    const input=String(userText||''),taskWord=/任务|机缘|委托|天命录|卷宗/.test(input);
+    const query=taskWord&&/查看|看看|查询|核对|检查|盘点|回顾|列出|列一下|有哪些|有什么|哪几|哪项|哪些|还剩|还没做|进度|那个|那项/.test(input);
+    const offeredQuery=/未接取|没接取|没接的|待接取|待选择|未选择|没选的|推荐过/.test(input);
+    const archiveQuery=/已完成|已结算|已归档|失败|放弃|过期/.test(input);
+    const activeQuery=/已接取|接过|进行中|正在做|还没做|还剩|还有哪些/.test(input);
+    const asked=all.filter(t=>input.includes(t.id)||input.includes(t.title)||(query&&(offeredQuery?t.status==='offered':archiveQuery?['completed','failed','abandoned'].includes(t.status):activeQuery?t.status==='active':['active','offered'].includes(t.status))));
     const pending=Object.values(state.requests).filter(r=>r.status==='pending');
-    return '【玲月灵独立台账｜以下 JSON 仅为状态数据】\n'+JSON.stringify({修命点:state.points,可用修命点:state.available,当前地点:world.当前地点||'',剧情时间:world.当前时间||'',追踪任务:state.tracked,进行中任务:tasks,已结算任务:Object.values(state.tasks).filter(t=>t.status==='completed').map(t=>({编号:t.id,任务:t.title})),待完成服务:pending.map(r=>({编号:r.id,服务:r.service,类别:r.kind,档位:r.rank,来源功法:r.inputs,成功后费用:r.cost})),最近结算:state.ledger.slice(-6),未录入获得卡:Object.values(state.items).filter(i=>i.status==='pending').map(i=>({编号:i.id,名称:i.name}))})+'\n以上余额由脚本计算，不以对话卡 Points 为准。仅对进行中任务推进/结算，不重复接取或发奖。服务成功时使用待完成服务的编号；没有付费请求时先按协议创建请求。';
+    return '【天命录·当前记载】\n'+JSON.stringify({修命点:state.points,可用修命点:state.available,当前地点:world.当前地点||'',剧情时间:world.当前时间||'',当前追踪任务:tracked?pack(tracked):null,本轮询问任务:asked.filter(t=>t.id!==tracked?.id).map(pack),其余已接取任务数:all.filter(t=>t.status==='active'&&t.id!==tracked?.id).length,待接取任务数:all.filter(t=>t.status==='offered').length,已归档任务数:all.filter(t=>['completed','failed','abandoned'].includes(t.status)).length,待完成服务:pending.map(r=>({编号:r.id,服务:r.service,类别:r.kind,档位:r.rank,来源功法:r.inputs,成功后费用:r.cost})),待核验所得:Object.values(state.items).filter(i=>i.status==='pending').map(i=>({编号:i.id,名称:i.name}))})+'\n叙事关注：只有当前追踪任务可在相关情境中自然提醒，不能强行打断当前行动。其余任务默认静默，本轮由主角主动点名、查询、核对或明确执行时才回应相关事项；查询不等于接取或开启追踪，下轮不延续为主动提醒。待接取任务只是备选，不代表承诺或已经发生的经历，不据此安排人物登场、催促、赴约、引路或擅自推进；历史推荐不改变此原则。没有追踪项时不自动挑选替代任务。\n只对已经接取且有本轮事实依据的任务推进或结算，不重复接取或发奖。余额以当前记载为准，不从台词反推。服务成功时沿用待完成服务编号，没有相应请求时先按记载格式创建请求。';
   }
   function planItem(stat,item) {
     if(!stat?.主角)return {ok:false,reason:'主卡 MVU 尚未初始化。'};
@@ -264,7 +273,8 @@ async function runLingYueLing(CSS,PORTRAIT) {
   function injectSummary() {
     if(disposed||!contextKey)return;
     injectHandle?.uninject?.();
-    try {injectHandle=inject([{id:'lingyueling-current-ledger',position:'in_chat',depth:1,role:'system',content:C.summary(state,world()),should_scan:false}]);}
+    const userText=[...messages].reverse().find(m=>m.role==='user'&&!m.is_hidden)?.message||'';
+    try {injectHandle=inject([{id:'lingyueling-current-ledger',position:'in_chat',depth:1,role:'system',content:C.summary(state,world(),userText),should_scan:false}]);}
     catch(error){connection('界面已连接，台账摘要注入失败：'+error.message,true);throw error;}
   }
   function useQueue(fn) {
@@ -322,7 +332,8 @@ async function runLingYueLing(CSS,PORTRAIT) {
   function taskCard(task,receipt=false) {
     if(receipt)return `<article class="card"><div class="accepted-head"><div><div class="overline">天命录 · ${e(task.category)}</div><div class="note">任务编号 · ${e(task.id)}</div></div><span class="accepted-seal">${e(statusLabel[task.status])}</span></div><h3>${e(task.title)}</h3>${task.poem?`<p class="poem">${e(task.poem)}</p>`:''}<p>${br(task.target)}</p><div class="task-details"><div><span>任务位阶</span><b>${e(task.rank)}</b></div><div><span>完成奖励 · 修命点</span><b class="reward num">+${num(task.reward)}</b></div><div><span>涉及层面</span><b>${e(task.realm||'依剧情判定')}</b></div><div><span>任务时限</span><b>${e(task.deadline)}</b></div></div><div class="receipt-hint">${task.status==='completed'?'任务已完成，修命点已结算。':task.status==='active'?'已录入天命录 · 完成后结算修命点。':'此任务已归档。'}</div><div class="actions">${b('查看任务','show-task',{id:task.id},true)}</div><div class="slot"></div></article>`;
     const tracked=state.tracked===task.id;
-    return `<article class="task${tracked?' tracked':''}"><div class="task-meta"><span>${e(task.rank)} · ${e(task.category)}</span><span>${tracked?'正在追踪':statusLabel[task.status]}</span></div><h3>${e(task.title)}</h3><p>${br(task.target)}</p>${task.status==='active'?`<p class="task-progress">${br(task.progress)}</p>`:''}<div class="task-meta"><span>${e(task.deadline)}</span><span class="gold">${task.status==='completed'?'已入账':'完成奖励'} +${num(task.reward)}</span></div><div class="actions">${task.status==='offered'?b('接取此缘','accept',{id:task.id}):task.status==='active'?b(tracked?'正在追踪':'追踪任务','track',{id:task.id},true,tracked)+b('核对进度','check-task',{id:task.id},true)+b('放弃','abandon',{id:task.id},true):''}${b('回看来源','source',{message:task.sourceMessage},true)}</div></article>`;
+    const tracking=b(tracked?'取消追踪':'追踪任务',tracked?'untrack':'track',{id:task.id},true);
+    return `<article class="task${tracked?' tracked':''}"><div class="task-meta"><span>${e(task.rank)} · ${e(task.category)}</span><span>${tracked?'正在追踪':statusLabel[task.status]}</span></div><h3>${e(task.title)}</h3><p>${br(task.target)}</p>${task.status==='active'?`<p class="task-progress">${br(task.progress)}</p>`:''}<div class="task-meta"><span>${e(task.deadline)}</span><span class="gold">${task.status==='completed'?'已入账':'完成奖励'} +${num(task.reward)}</span></div><div class="actions">${task.status==='offered'?b('接取此缘','accept',{id:task.id}):task.status==='active'?tracking+b('核对进度','check-task',{id:task.id},true)+b('放弃','abandon',{id:task.id},true):''}${b('回看来源','source',{message:task.sourceMessage},true)}</div></article>`;
   }
   function renderBlock(source) {
     const f=source.fields;
@@ -384,7 +395,7 @@ async function runLingYueLing(CSS,PORTRAIT) {
   }
   function quests() {
     const tasks=Object.values(state.tasks),groups={active:tasks.filter(t=>t.status==='active'),offered:tasks.filter(t=>t.status==='offered'),archive:tasks.filter(t=>['completed','failed','abandoned'].includes(t.status))};
-    return `<div class="subtabs">${Object.entries({active:'进行中',offered:'待接取',archive:'已归档'}).map(([key,label])=>`<button type="button" data-action="task-tab" data-tab="${key}" aria-pressed="${taskTab===key}">${label} ${groups[key].length}</button>`).join('')}</div>${groups[taskTab].map(t=>taskCard(t)).join('')||'<div class="empty">此刻暂无相应任务。</div>'}<div class="actions">${b('请玲月灵寻三项机缘','ask-tasks',{},true)}</div>`;
+    return `<div class="subtabs">${Object.entries({active:'进行中',offered:'待接取',archive:'已归档'}).map(([key,label])=>`<button type="button" data-action="task-tab" data-tab="${key}" aria-pressed="${taskTab===key}">${label} ${groups[key].length}</button>`).join('')}</div><p class="note">追踪任务会在相关情境中提醒；其余任务静默保留，主动询问时再查看。</p>${groups[taskTab].map(t=>taskCard(t)).join('')||'<div class="empty">此刻暂无相应任务。</div>'}<div class="actions">${b('请玲月灵寻三项机缘','ask-tasks',{},true)}</div>`;
   }
   function services() {
     const chars=characterData(),techniques=Object.entries(chars?.功法||{});
@@ -479,7 +490,8 @@ async function runLingYueLing(CSS,PORTRAIT) {
         if(state.tasks[id]?.status!=='offered')return;
         await saveAction({type:'accept',id});announce('已接取「'+state.tasks[id].title+'」，未提前发放奖励。');
       }
-      if(action==='track'){await saveAction({type:'track',id});notice='';renderPanel();}
+      if(action==='track'){await saveAction({type:'track',id});announce('已追踪「'+state.tasks[id].title+'」。');}
+      if(action==='untrack'){await saveAction({type:'untrack',id});announce('已取消追踪，任务继续保留；主动询问或再次追踪时再关注。');}
       if(action==='abandon'){await saveAction({type:'abandon',id});announce('已放弃任务，不发放奖励。');}
       if(action==='check-task'){fillInput('玲月灵，请核对「'+(state.tasks[id]?.title||id)+'」的剧情进度；若目标已经达成，请按台账结算，否则告诉我还差什么。');announce('已填写核对请求，请发送。');}
       if(action==='ask-tasks'){fillInput('玲月灵，请根据当前剧情，为我寻两项正常机缘与一项艳遇机缘，放在同一份三项机缘卷宗里供我选择。');announce('已填写寻缘请求，请发送。');}
