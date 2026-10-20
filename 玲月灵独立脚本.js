@@ -50,6 +50,27 @@ function createLingCore() {
     const value=kind==='technique'?{类型:text(f.Type,120),境界:'未入门',熟练度:0,描述:description}:{等级:text(f.ActualRank,80),类型:text(f.Type,120),损耗度:0,状态:'正常',描述:description};
     return {id,name,kind,source:f.Source,requestId:safeId(f.RequestId),value,fields:f,blockUid:block.uid,sourceMessage:source.message_id,sourceHash:source.chain,uid:source.chain+':'+block.uid,status:'pending'};
   }
+  // 只判定获得卡的重复显示，不改变历史消息、物品凭据或分支链。
+  function itemCardDuplicates(messages) {
+    const duplicates=dict(),ids=new Set(),requests=new Set(),contents=new Set();
+    const normalize=value=>String(value||'').replace(/\s+/g,'').trim();
+    for(const message of messages) {
+      if(message.role!=='assistant')continue;
+      let ordinal=0;
+      for(const block of blocks(message.message)) {
+        if(block.tag!=='LingItem')continue;
+        const key=message.message_id+':'+ordinal++;
+        const item=itemFrom(block,{message_id:message.message_id,chain:''});
+        if(!item)continue;
+        const f=item.fields;
+        const content=JSON.stringify([item.kind,item.name,item.kind==='technique'?f.RankAttr:f.ActualRank,f.Type,f.Attribute,f.BaseEffect,f.SpecEffect,f.Limit,f.Inputs].map(normalize));
+        const request=item.source!=='story'&&item.requestId?JSON.stringify([item.source,item.kind,item.requestId,item.kind==='technique'?f.RankAttr:f.ActualRank]):'';
+        if(ids.has(item.id)||(request?requests.has(request):contents.has(content)))duplicates[key]=true;
+        ids.add(item.id);contents.add(content);if(request)requests.add(request);
+      }
+    }
+    return duplicates;
+  }
   function makeState(seed=500) {
     const points=Number.isSafeInteger(seed)&&seed>=0?seed:500;
     return {points,available:points,tasks:dict(),requests:dict(),items:dict(),ledger:[{id:'seed',reason:'初始修命点',amount:points}],tracked:'',issues:[],receipts:[],sources:[],chain:'',messageChains:dict()};
@@ -173,7 +194,7 @@ function createLingCore() {
     const activeQuery=/已接取|接过|进行中|正在做|还没做|还剩|还有哪些/.test(input);
     const asked=all.filter(t=>input.includes(t.id)||input.includes(t.title)||(query&&(offeredQuery?t.status==='offered':archiveQuery?['completed','failed','abandoned'].includes(t.status):activeQuery?t.status==='active':['active','offered'].includes(t.status))));
     const pending=Object.values(state.requests).filter(r=>r.status==='pending');
-    return '【天命录·当前记载】\n'+JSON.stringify({修命点:state.points,可用修命点:state.available,当前地点:world.当前地点||'',剧情时间:world.当前时间||'',当前追踪任务:tracked?pack(tracked):null,本轮询问任务:asked.filter(t=>t.id!==tracked?.id).map(pack),其余已接取任务数:all.filter(t=>t.status==='active'&&t.id!==tracked?.id).length,待接取任务数:all.filter(t=>t.status==='offered').length,已归档任务数:all.filter(t=>['completed','failed','abandoned'].includes(t.status)).length,待完成服务:pending.map(r=>({编号:r.id,服务:r.service,类别:r.kind,档位:r.rank,来源功法:r.inputs,成功后费用:r.cost})),待核验所得:Object.values(state.items).filter(i=>i.status==='pending').map(i=>({编号:i.id,名称:i.name}))})+'\n叙事关注：只有当前追踪任务可在相关情境中自然提醒，不能强行打断当前行动。其余任务默认静默，本轮由主角主动点名、查询、核对或明确执行时才回应相关事项；查询不等于接取或开启追踪，下轮不延续为主动提醒。待接取任务只是备选，不代表承诺或已经发生的经历，不据此安排人物登场、催促、赴约、引路或擅自推进；历史推荐不改变此原则。没有追踪项时不自动挑选替代任务。\n只对已经接取且有本轮事实依据的任务推进或结算，不重复接取或发奖。余额以当前记载为准，不从台词反推。服务成功时沿用待完成服务编号，没有相应请求时先按记载格式创建请求。';
+    return '【天命录·当前记载】\n'+JSON.stringify({修命点:state.points,可用修命点:state.available,当前地点:world.当前地点||'',剧情时间:world.当前时间||'',当前追踪任务:tracked?pack(tracked):null,本轮询问任务:asked.filter(t=>t.id!==tracked?.id).map(pack),其余已接取任务数:all.filter(t=>t.status==='active'&&t.id!==tracked?.id).length,待接取任务数:all.filter(t=>t.status==='offered').length,已归档任务数:all.filter(t=>['completed','failed','abandoned'].includes(t.status)).length,已记载所得:Object.values(state.items).map(i=>({编号:i.id,名称:i.name,类别:i.kind==='technique'?'功法':'器物'})),待完成服务:pending.map(r=>({编号:r.id,服务:r.service,类别:r.kind,档位:r.rank,来源功法:r.inputs,成功后费用:r.cost})),待核验所得:Object.values(state.items).filter(i=>i.status==='pending').map(i=>({编号:i.id,名称:i.name}))})+'\n叙事关注：只有当前追踪任务可在相关情境中自然提醒，不能强行打断当前行动。其余任务默认静默，本轮由主角主动点名、查询、核对或明确执行时才回应相关事项；查询不等于接取或开启追踪，下轮不延续为主动提醒。待接取任务只是备选，不代表承诺或已经发生的经历，不据此安排人物登场、催促、赴约、引路或擅自推进；历史推荐不改变此原则。没有追踪项时不自动挑选替代任务。\n只对已经接取且有本轮事实依据的任务推进或结算，不重复接取或发奖。余额以当前记载为准，不从台词反推。已记载所得仅供回忆，装备、使用、修习、查看或介绍旧物时不再输出 LingItem，也不创建新的祈愿或融合请求；只有本轮实际新获得时才输出一次获得卡。服务成功时沿用待完成服务编号，没有相应请求时先按记载格式创建请求。';
   }
   function planItem(stat,item) {
     if(!stat?.主角)return {ok:false,reason:'主卡 MVU 尚未初始化。'};
@@ -187,7 +208,7 @@ function createLingCore() {
     }
     return {ok:true,existing:false,field};
   }
-  return {REWARDS,COSTS,TAGS,hash,blocks,fields,normalizeTask,itemFrom,replay,summary,eligibleItem,planItem,safeId,clone};
+  return {REWARDS,COSTS,TAGS,hash,blocks,fields,normalizeTask,itemFrom,itemCardDuplicates,replay,summary,eligibleItem,planItem,safeId,clone};
 }
 
 /* 构建时与 core.cjs、ui.css、立绘一起内嵌；不加载远程代码。 */
@@ -230,7 +251,7 @@ async function runLingYueLing(CSS,PORTRAIT) {
   let mvuReady=false,mvuUpdating=false,injectHandle,lastSignature='',syncTimer,observer;
   let generationAt=0,sawHostBusy=false,mvuRef=null,eventBus=null,helperRef=null,eventNames='',bound=false,lastError='',lastErrorAt=0;
   const hostStops=[],mvuStops=[];
-  const stops=[],cardRoots=new Map(),receiptRoots=new Map(),boundRoots=new WeakSet();
+  const stops=[],cardRoots=new Map(),receiptRoots=new Map(),boundRoots=new WeakSet(),itemDisplays=new WeakMap();
   const panelHost=doc.createElement('div');panelHost.className='lingyueling-shared-sea';
   const panel=panelHost.attachShadow({mode:'open'});
   const e=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -379,8 +400,20 @@ async function runLingYueLing(CSS,PORTRAIT) {
     return '';
   }
   function bindRoot(shadow){if(boundRoots.has(shadow))return;boundRoots.add(shadow);shadow.addEventListener('click',event=>{const el=event.target.closest('button[data-action]');if(el&&!el.disabled)dispatch(el,shadow);});}
+  function setItemDuplicate(hook,repeated) {
+    if(repeated) {
+      if(!itemDisplays.has(hook))itemDisplays.set(hook,{hidden:hook.hidden,display:hook.style.getPropertyValue('display'),priority:hook.style.getPropertyPriority('display')});
+      hook.hidden=true;hook.dataset.lylDuplicateItem='true';hook.style.setProperty('display','none','important');
+    }else if(hook.dataset.lylDuplicateItem==='true'){
+      const previous=itemDisplays.get(hook);
+      hook.hidden=previous?.hidden||false;delete hook.dataset.lylDuplicateItem;
+      if(previous?.display)hook.style.setProperty('display',previous.display,previous.priority);else hook.style.removeProperty('display');
+      itemDisplays.delete(hook);
+    }
+  }
   function renderCards() {
     if(!doc.querySelector('#chat'))return;
+    const duplicateItems=C.itemCardDuplicates(messages);
     for(const [hook]of cardRoots)if(!hook.isConnected)cardRoots.delete(hook);
     for(const message of messages) {
       if(message.role!=='assistant')continue;
@@ -390,6 +423,9 @@ async function runLingYueLing(CSS,PORTRAIT) {
       for(const hook of mes.querySelectorAll('[data-lyl-kind]')) {
         const tag=hook.dataset.lylKind;if(tag==='LingEvent')continue;
         const index=counts[tag]||0;counts[tag]=index+1;
+        if(tag==='LingItem') {
+          const repeated=!!duplicateItems[message.message_id+':'+index];setItemDuplicate(hook,repeated);if(repeated)continue;
+        }
         const source=sources.filter(s=>s.tag===tag)[index];if(!source)continue;
         let record=cardRoots.get(hook);
         if(!record){const shadow=hook.shadowRoot||hook.attachShadow({mode:'open'});record={shadow,signature:''};cardRoots.set(hook,record);bindRoot(shadow);}
@@ -552,6 +588,7 @@ async function runLingYueLing(CSS,PORTRAIT) {
     injectHandle?.uninject?.();try{uninject?.(['lingyueling-current-ledger']);}catch{}
     stops.splice(0).reverse().forEach(stop=>{try{stop();}catch{}});
     observer?.disconnect();panelHost.remove();receiptRoots.forEach(el=>el.remove());
+    for(const hook of doc.querySelectorAll('[data-lyl-duplicate-item]'))setItemDuplicate(hook,false);
     for(const [hook]of cardRoots){if(hook.isConnected){const replacement=hook.cloneNode(true);hook.replaceWith(replacement);}}
     if(host[KEY]===cleanup)delete host[KEY];
   }
